@@ -1,18 +1,18 @@
-import { writeFile, mkdir } from 'node:fs/promises';
-import { dirname } from 'node:path';
+import { writeFile, mkdir, readFile } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
 import process from 'node:process';
+import { Database } from 'bun:sqlite';
+import { homedir } from 'node:os';
 
 // ============================================================================
 // Constants
 // ============================================================================
 
-const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent';
-const OPENAI_DEFAULT_API_BASE = 'https://api.openai.com/v1';
-const OPENAI_DEFAULT_MODEL = 'gpt-4o-mini';
+const MINIMAX_API_URL = 'https://api.minimax.chat/v1/text/chatcompletion_v2';
 const FEED_FETCH_TIMEOUT_MS = 15_000;
 const FEED_CONCURRENCY = 10;
-const GEMINI_BATCH_SIZE = 10;
-const MAX_CONCURRENT_GEMINI = 2;
+const MINIMAX_BATCH_SIZE = 8;
+const MAX_CONCURRENT_MINIMAX = 3;
 
 // 90 RSS feeds from Hacker News Popularity Contest 2025 (curated by Karpathy)
 const RSS_FEEDS: Array<{ name: string; xmlUrl: string; htmlUrl: string }> = [
@@ -148,7 +148,7 @@ interface ScoredArticle extends Article {
   reason: string;
 }
 
-interface GeminiScoringResult {
+interface MinimaxScoringResult {
   results: Array<{
     index: number;
     relevance: number;
@@ -159,17 +159,13 @@ interface GeminiScoringResult {
   }>;
 }
 
-interface GeminiSummaryResult {
+interface MinimaxSummaryResult {
   results: Array<{
     index: number;
     titleZh: string;
     summary: string;
     reason: string;
   }>;
-}
-
-interface AIClient {
-  call(prompt: string): Promise<string>;
 }
 
 // ============================================================================
@@ -291,212 +287,210 @@ function parseRSSItems(xml: string): Array<{ title: string; link: string; pubDat
 }
 
 // ============================================================================
-// Feed Fetching
+// Article Content Fetching (for AI summarization)
 // ============================================================================
 
-async function fetchFeed(feed: { name: string; xmlUrl: string; htmlUrl: string }): Promise<Article[]> {
+async function fetchArticleContent(url: string): Promise<string> {
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), FEED_FETCH_TIMEOUT_MS);
-    
-    const response = await fetch(feed.xmlUrl, {
-      signal: controller.signal,
+    const response = await fetch(url, {
+      method: 'GET',
       headers: {
-        'User-Agent': 'AI-Daily-Digest/1.0 (RSS Reader)',
-        'Accept': 'application/rss+xml, application/atom+xml, application/xml, text/xml, */*',
+        'User-Agent': 'Mozilla/5.0 (compatible; RSS Reader)',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
       },
+      signal: AbortSignal.timeout(8000),
     });
     
-    clearTimeout(timeout);
+    if (!response.ok) return '';
     
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
+    const html = await response.text();
+    return extractMainContent(html);
+  } catch {
+    return '';
+  }
+}
+
+function extractMainContent(html: string): string {
+  // Limit HTML size first to avoid memory issues
+  const limitedHtml = html.slice(0, 50000);
+  
+  return limitedHtml
+    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<nav[^>]*>[\s\S]*?<\/nav>/gi, ' ')
+    .replace(/<header[^>]*>[\s\S]*?<\/header>/gi, ' ')
+    .replace(/<footer[^>]*>[\s\S]*?<\/footer>/gi, ' ')
+    .replace(/<aside[^>]*>[\s\S]*?<\/aside>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 1500); // Strict limit for AI context
+}
+
+// ============================================================================
+// Config
+// ============================================================================
+
+async function loadApiKey(): Promise<string | undefined> {
+  // 1. Environment variable
+  if (process.env.MINIMAX_API_KEY) {
+    return process.env.MINIMAX_API_KEY;
+  }
+
+  // 2. Config file: ~/.ai-digest/config.json
+  try {
+    const configPath = join(homedir(), '.ai-digest', 'config.json');
+    const content = await readFile(configPath, 'utf-8');
+    const config = JSON.parse(content) as { minimaxApiKey?: string };
+    if (config.minimaxApiKey) {
+      console.log('[digest] Loaded API key from ~/.ai-digest/config.json');
+      return config.minimaxApiKey;
     }
-    
-    const xml = await response.text();
-    const items = parseRSSItems(xml);
-    
-    return items.map(item => ({
-      title: item.title,
-      link: item.link,
-      pubDate: parseDate(item.pubDate) || new Date(0),
-      description: item.description,
-      sourceName: feed.name,
-      sourceUrl: feed.htmlUrl,
+  } catch {
+    // Config file not found or invalid, ignore
+  }
+
+  return undefined;
+}
+
+// ============================================================================
+// Fusion Integration
+// ============================================================================
+
+async function fetchFromFusion(hours: number): Promise<Article[]> {
+  const dbPath = process.env.FUSION_DB_PATH || '/Users/jerin/apps/fusion/fusion.db';
+  console.log(`[digest] Connecting to fusion database: ${dbPath}`);
+
+  const db = new Database(dbPath);
+
+  try {
+    const cutoffTime = Math.floor(Date.now() / 1000) - hours * 3600;
+
+    const query = `
+      SELECT
+        i.id,
+        i.title,
+        i.link,
+        i.content,
+        i.pub_date,
+        f.name as feed_name,
+        f.site_url as feed_site_url
+      FROM items i
+      JOIN feeds f ON i.feed_id = f.id
+      WHERE i.pub_date > ?
+      ORDER BY i.pub_date DESC
+    `;
+
+    const rows = db.query(query).all(cutoffTime) as Array<{
+      id: number;
+      title: string;
+      link: string;
+      content: string;
+      pub_date: number;
+      feed_name: string;
+      feed_site_url: string;
+    }>;
+
+    console.log(`[digest] Fetched ${rows.length} articles from fusion (last ${hours} hours)`);
+
+    return rows.map(row => ({
+      title: row.title || 'Untitled',
+      link: row.link || '',
+      pubDate: new Date(row.pub_date * 1000),
+      description: stripHtml(row.content || '').slice(0, 2000),
+      sourceName: row.feed_name || 'unknown',
+      sourceUrl: row.feed_site_url || '',
     }));
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
-    // Only log non-abort errors to reduce noise
-    if (!msg.includes('abort')) {
-      console.warn(`[digest] ✗ ${feed.name}: ${msg}`);
-    } else {
-      console.warn(`[digest] ✗ ${feed.name}: timeout`);
-    }
-    return [];
+  } finally {
+    db.close();
   }
 }
 
-async function fetchAllFeeds(feeds: typeof RSS_FEEDS): Promise<Article[]> {
-  const allArticles: Article[] = [];
-  let successCount = 0;
-  let failCount = 0;
-  
-  for (let i = 0; i < feeds.length; i += FEED_CONCURRENCY) {
-    const batch = feeds.slice(i, i + FEED_CONCURRENCY);
-    const results = await Promise.allSettled(batch.map(fetchFeed));
-    
-    for (const result of results) {
-      if (result.status === 'fulfilled' && result.value.length > 0) {
-        allArticles.push(...result.value);
-        successCount++;
-      } else {
-        failCount++;
+async function fetchAllFeeds(hours: number): Promise<Article[]> {
+  console.log('[digest] Fetching articles from fusion database...');
+  const articles = await fetchFromFusion(hours);
+  console.log(`[digest] ✓ Fetched ${articles.length} articles from fusion database`);
+  return articles;
+}
+
+// ============================================================================
+// MiniMax API
+// ============================================================================
+
+async function callMinimax(prompt: string, apiKey: string, model: string = 'MiniMax-M2.5', retries = 3): Promise<string> {
+  let lastError: Error | undefined;
+
+  for (let attempt = 0; attempt < retries; attempt++) {
+    try {
+      if (attempt > 0) {
+        const delay = Math.min(1000 * Math.pow(2, attempt), 8000);
+        console.warn(`[digest] Retry ${attempt}/${retries - 1} after ${delay}ms...`);
+        await new Promise(r => setTimeout(r, delay));
       }
-    }
-    
-    const progress = Math.min(i + FEED_CONCURRENCY, feeds.length);
-    console.log(`[digest] Progress: ${progress}/${feeds.length} feeds processed (${successCount} ok, ${failCount} failed)`);
-  }
-  
-  console.log(`[digest] Fetched ${allArticles.length} articles from ${successCount} feeds (${failCount} failed)`);
-  return allArticles;
-}
 
-// ============================================================================
-// AI Providers (Gemini + OpenAI-compatible fallback)
-// ============================================================================
+      const response = await fetch(MINIMAX_API_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({
+          model,
+          messages: [
+            { role: 'user', content: [{ type: 'text', text: prompt }] }
+          ],
+          temperature: 0.3,
+          max_tokens: 8192,
+        }),
+        signal: AbortSignal.timeout(90_000),
+      });
 
-async function callGemini(prompt: string, apiKey: string): Promise<string> {
-  const response = await fetch(`${GEMINI_API_URL}?key=${apiKey}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: {
-        temperature: 0.3,
-        topP: 0.8,
-        topK: 40,
-      },
-    }),
-  });
-  
-  if (!response.ok) {
-    const errorText = await response.text().catch(() => 'Unknown error');
-    throw new Error(`Gemini API error (${response.status}): ${errorText}`);
-  }
-  
-  const data = await response.json() as {
-    candidates?: Array<{
-      content?: { parts?: Array<{ text?: string }> };
-    }>;
-  };
-  
-  return data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-}
+      if (!response.ok) {
+        const errorText = await response.text().catch(() => 'Unknown error');
+        throw new Error(`MiniMax API error (${response.status}): ${errorText}`);
+      }
 
-async function callOpenAICompatible(
-  prompt: string,
-  apiKey: string,
-  apiBase: string,
-  model: string
-): Promise<string> {
-  const normalizedBase = apiBase.replace(/\/+$/, '');
-  const response = await fetch(`${normalizedBase}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({
-      model,
-      messages: [{ role: 'user', content: prompt }],
-      temperature: 0.3,
-      top_p: 0.8,
-    }),
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text().catch(() => 'Unknown error');
-    throw new Error(`OpenAI-compatible API error (${response.status}): ${errorText}`);
-  }
-
-  const data = await response.json() as {
-    choices?: Array<{
-      message?: {
-        content?: string | Array<{ type?: string; text?: string }>;
+      const data = await response.json() as {
+        choices?: Array<{
+          message?: { content?: string };
+        }>;
+        base_resp?: { status_code?: number; status_msg?: string };
       };
-    }>;
-  };
 
-  const content = data.choices?.[0]?.message?.content;
-  if (typeof content === 'string') return content;
-  if (Array.isArray(content)) {
-    return content
-      .filter(item => item.type === 'text' && typeof item.text === 'string')
-      .map(item => item.text)
-      .join('\n');
-  }
-  return '';
-}
-
-function inferOpenAIModel(apiBase: string): string {
-  const base = apiBase.toLowerCase();
-  if (base.includes('deepseek')) return 'deepseek-chat';
-  return OPENAI_DEFAULT_MODEL;
-}
-
-function createAIClient(config: {
-  geminiApiKey?: string;
-  openaiApiKey?: string;
-  openaiApiBase?: string;
-  openaiModel?: string;
-}): AIClient {
-  const state = {
-    geminiApiKey: config.geminiApiKey?.trim() || '',
-    openaiApiKey: config.openaiApiKey?.trim() || '',
-    openaiApiBase: (config.openaiApiBase?.trim() || OPENAI_DEFAULT_API_BASE).replace(/\/+$/, ''),
-    openaiModel: config.openaiModel?.trim() || '',
-    geminiEnabled: Boolean(config.geminiApiKey?.trim()),
-    fallbackLogged: false,
-  };
-
-  if (!state.openaiModel) {
-    state.openaiModel = inferOpenAIModel(state.openaiApiBase);
-  }
-
-  return {
-    async call(prompt: string): Promise<string> {
-      if (state.geminiEnabled && state.geminiApiKey) {
-        try {
-          return await callGemini(prompt, state.geminiApiKey);
-        } catch (error) {
-          if (state.openaiApiKey) {
-            if (!state.fallbackLogged) {
-              const reason = error instanceof Error ? error.message : String(error);
-              console.warn(`[digest] Gemini failed, switching to OpenAI-compatible fallback (${state.openaiApiBase}, model=${state.openaiModel}). Reason: ${reason}`);
-              state.fallbackLogged = true;
-            }
-            state.geminiEnabled = false;
-            return callOpenAICompatible(prompt, state.openaiApiKey, state.openaiApiBase, state.openaiModel);
-          }
-          throw error;
-        }
+      // Check for API-level errors
+      if (data.base_resp?.status_code && data.base_resp.status_code !== 0) {
+        throw new Error(`MiniMax API error: ${data.base_resp.status_msg || 'Unknown error'}`);
       }
 
-      if (state.openaiApiKey) {
-        return callOpenAICompatible(prompt, state.openaiApiKey, state.openaiApiBase, state.openaiModel);
+      // Handle new content format: could be string or array
+      const content = data.choices?.[0]?.message?.content;
+      if (typeof content === 'string') {
+        return content;
+      } else if (Array.isArray(content)) {
+        return content.map((c: any) => c.text || c.content || '').join('');
       }
+      return '';
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error));
+      if (attempt < retries - 1) continue;
+    }
+  }
 
-      throw new Error('No AI API key configured. Set GEMINI_API_KEY and/or OPENAI_API_KEY.');
-    },
-  };
+  throw lastError || new Error('callMinimax failed after retries');
 }
 
 function parseJsonResponse<T>(text: string): T {
   let jsonText = text.trim();
   // Strip markdown code blocks if present
   if (jsonText.startsWith('```')) {
-    jsonText = jsonText.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '');
+    jsonText = jsonText.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '').trim();
+  }
+  // Try to extract JSON object from response if it's not pure JSON
+  if (!jsonText.startsWith('{')) {
+    const match = jsonText.match(/\{[\s\S]*\}/);
+    if (match) {
+      jsonText = match[0];
+    }
   }
   return JSON.parse(jsonText) as T;
 }
@@ -566,7 +560,7 @@ ${articlesList}
 
 async function scoreArticlesWithAI(
   articles: Article[],
-  aiClient: AIClient
+  apiKey: string
 ): Promise<Map<number, { relevance: number; quality: number; timeliness: number; category: CategoryId; keywords: string[] }>> {
   const allScores = new Map<number, { relevance: number; quality: number; timeliness: number; category: CategoryId; keywords: string[] }>();
   
@@ -578,21 +572,21 @@ async function scoreArticlesWithAI(
   }));
   
   const batches: typeof indexed[] = [];
-  for (let i = 0; i < indexed.length; i += GEMINI_BATCH_SIZE) {
-    batches.push(indexed.slice(i, i + GEMINI_BATCH_SIZE));
+  for (let i = 0; i < indexed.length; i += MINIMAX_BATCH_SIZE) {
+    batches.push(indexed.slice(i, i + MINIMAX_BATCH_SIZE));
   }
   
   console.log(`[digest] AI scoring: ${articles.length} articles in ${batches.length} batches`);
   
   const validCategories = new Set<string>(['ai-ml', 'security', 'engineering', 'tools', 'opinion', 'other']);
   
-  for (let i = 0; i < batches.length; i += MAX_CONCURRENT_GEMINI) {
-    const batchGroup = batches.slice(i, i + MAX_CONCURRENT_GEMINI);
+  for (let i = 0; i < batches.length; i += MAX_CONCURRENT_MINIMAX) {
+    const batchGroup = batches.slice(i, i + MAX_CONCURRENT_MINIMAX);
     const promises = batchGroup.map(async (batch) => {
       try {
         const prompt = buildScoringPrompt(batch);
-        const responseText = await aiClient.call(prompt);
-        const parsed = parseJsonResponse<GeminiScoringResult>(responseText);
+        const responseText = await callMinimax(prompt, apiKey);
+        const parsed = parseJsonResponse<MinimaxScoringResult>(responseText);
         
         if (parsed.results && Array.isArray(parsed.results)) {
           for (const result of parsed.results) {
@@ -616,7 +610,7 @@ async function scoreArticlesWithAI(
     });
     
     await Promise.all(promises);
-    console.log(`[digest] Scoring progress: ${Math.min(i + MAX_CONCURRENT_GEMINI, batches.length)}/${batches.length} batches`);
+    console.log(`[digest] Scoring progress: ${Math.min(i + MAX_CONCURRENT_MINIMAX, batches.length)}/${batches.length} batches`);
   }
   
   return allScores;
@@ -631,7 +625,7 @@ function buildSummaryPrompt(
   lang: 'zh' | 'en'
 ): string {
   const articlesList = articles.map(a =>
-    `Index ${a.index}: [${a.sourceName}] ${a.title}\nURL: ${a.link}\n${a.description.slice(0, 800)}`
+    `Index ${a.index}: [${a.sourceName}] ${a.title}\n${a.description.slice(0, 600)}`
   ).join('\n\n---\n\n');
 
   const langInstruction = lang === 'zh'
@@ -675,7 +669,7 @@ ${articlesList}
 
 async function summarizeArticles(
   articles: Array<Article & { index: number }>,
-  aiClient: AIClient,
+  apiKey: string,
   lang: 'zh' | 'en'
 ): Promise<Map<number, { titleZh: string; summary: string; reason: string }>> {
   const summaries = new Map<number, { titleZh: string; summary: string; reason: string }>();
@@ -689,39 +683,45 @@ async function summarizeArticles(
   }));
   
   const batches: typeof indexed[] = [];
-  for (let i = 0; i < indexed.length; i += GEMINI_BATCH_SIZE) {
-    batches.push(indexed.slice(i, i + GEMINI_BATCH_SIZE));
+  for (let i = 0; i < indexed.length; i += MINIMAX_BATCH_SIZE) {
+    batches.push(indexed.slice(i, i + MINIMAX_BATCH_SIZE));
   }
   
   console.log(`[digest] Generating summaries for ${articles.length} articles in ${batches.length} batches`);
   
-  for (let i = 0; i < batches.length; i += MAX_CONCURRENT_GEMINI) {
-    const batchGroup = batches.slice(i, i + MAX_CONCURRENT_GEMINI);
+  for (let i = 0; i < batches.length; i += MAX_CONCURRENT_MINIMAX) {
+    const batchGroup = batches.slice(i, i + MAX_CONCURRENT_MINIMAX);
     const promises = batchGroup.map(async (batch) => {
       try {
         const prompt = buildSummaryPrompt(batch, lang);
-        const responseText = await aiClient.call(prompt);
-        const parsed = parseJsonResponse<GeminiSummaryResult>(responseText);
+        const responseText = await callMinimax(prompt, apiKey);
+        const parsed = parseJsonResponse<MinimaxSummaryResult>(responseText);
         
         if (parsed.results && Array.isArray(parsed.results)) {
           for (const result of parsed.results) {
+            const article = batch.find(a => a.index === result.index) || batch[0];
             summaries.set(result.index, {
-              titleZh: result.titleZh || '',
-              summary: result.summary || '',
-              reason: result.reason || '',
+              titleZh: result.titleZh || article.title,
+              summary: result.summary || article.description.slice(0, 300),
+              reason: result.reason || '【AI摘要失败】',
             });
+          }
+        } else {
+          console.warn(`[digest] Summary parse failed for batch, using fallbacks`);
+          for (const item of batch) {
+            summaries.set(item.index, { titleZh: item.title, summary: item.description.slice(0, 300), reason: '【AI解析失败】' });
           }
         }
       } catch (error) {
         console.warn(`[digest] Summary batch failed: ${error instanceof Error ? error.message : String(error)}`);
         for (const item of batch) {
-          summaries.set(item.index, { titleZh: item.title, summary: item.title, reason: '' });
+          summaries.set(item.index, { titleZh: item.title, summary: item.description.slice(0, 300), reason: '【AI摘要失败，使用原文描述】' });
         }
       }
     });
     
     await Promise.all(promises);
-    console.log(`[digest] Summary progress: ${Math.min(i + MAX_CONCURRENT_GEMINI, batches.length)}/${batches.length} batches`);
+    console.log(`[digest] Summary progress: ${Math.min(i + MAX_CONCURRENT_MINIMAX, batches.length)}/${batches.length} batches`);
   }
   
   return summaries;
@@ -733,7 +733,7 @@ async function summarizeArticles(
 
 async function generateHighlights(
   articles: ScoredArticle[],
-  aiClient: AIClient,
+  apiKey: string,
   lang: 'zh' | 'en'
 ): Promise<string> {
   const articleList = articles.slice(0, 10).map((a, i) =>
@@ -755,7 +755,7 @@ ${articleList}
 直接返回纯文本总结，不要 JSON，不要 markdown 格式。`;
 
   try {
-    const text = await aiClient.call(prompt);
+    const text = await callMinimax(prompt, apiKey);
     return text.trim();
   } catch (error) {
     console.warn(`[digest] Highlights generation failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -897,7 +897,7 @@ function generateDigestReport(articles: ScoredArticle[], highlights: string, sta
   const dateStr = now.toISOString().split('T')[0];
   
   let report = `# 📰 AI 博客每日精选 — ${dateStr}\n\n`;
-  report += `> 来自 Karpathy 推荐的 ${stats.totalFeeds} 个顶级技术博客，AI 精选 Top ${articles.length}\n\n`;
+  report += `> 来自 blogwatcher 追踪的 ${stats.totalFeeds} 个技术博客，AI 精选 Top ${articles.length}\n\n`;
 
   // ── Today's Highlights ──
   if (highlights) {
@@ -988,7 +988,7 @@ function generateDigestReport(articles: ScoredArticle[], highlights: string, sta
 
   // ── Footer ──
   report += `*生成于 ${dateStr} ${now.toISOString().split('T')[1]?.slice(0, 5) || ''} | 扫描 ${stats.successFeeds} 源 → 获取 ${stats.totalArticles} 篇 → 精选 ${articles.length} 篇*\n`;
-  report += `*基于 [Hacker News Popularity Contest 2025](https://refactoringenglish.com/tools/hn-popularity/) RSS 源列表，由 [Andrej Karpathy](https://x.com/karpathy) 推荐*\n`;
+  report += `*基于 blogwatcher 聚合的 RSS 源，使用 MiniMax AI 智能筛选*\n`;
   report += `*由「懂点儿AI」制作，欢迎关注同名微信公众号获取更多 AI 实用技巧 💡*\n`;
 
   return report;
@@ -1012,10 +1012,7 @@ Options:
   --help          Show this help
 
 Environment:
-  GEMINI_API_KEY   Optional but recommended. Get one at https://aistudio.google.com/apikey
-  OPENAI_API_KEY   Optional fallback key for OpenAI-compatible APIs
-  OPENAI_API_BASE  Optional fallback base URL (default: https://api.openai.com/v1)
-  OPENAI_MODEL     Optional fallback model (default: deepseek-chat for DeepSeek base, else gpt-4o-mini)
+  MINIMAX_API_KEY  Required. Get one at https://platform.minimaxi.com
 
 Examples:
   bun scripts/digest.ts --hours 24 --top-n 10 --lang zh
@@ -1025,6 +1022,17 @@ Examples:
 }
 
 async function main(): Promise<void> {
+  // Sync lowercase proxy env vars to uppercase (Bun's fetch only reads uppercase)
+  if (!process.env.HTTPS_PROXY && process.env.https_proxy) {
+    process.env.HTTPS_PROXY = process.env.https_proxy;
+  }
+  if (!process.env.HTTP_PROXY && process.env.http_proxy) {
+    process.env.HTTP_PROXY = process.env.http_proxy;
+  }
+  if (!process.env.NO_PROXY && process.env.no_proxy) {
+    process.env.NO_PROXY = process.env.no_proxy;
+  }
+
   const args = process.argv.slice(2);
   if (args.includes('--help') || args.includes('-h')) printUsage();
   
@@ -1046,27 +1054,17 @@ async function main(): Promise<void> {
     }
   }
   
-  const geminiApiKey = process.env.GEMINI_API_KEY;
-  const openaiApiKey = process.env.OPENAI_API_KEY;
-  const openaiApiBase = process.env.OPENAI_API_BASE;
-  const openaiModel = process.env.OPENAI_MODEL;
-
-  if (!geminiApiKey && !openaiApiKey) {
-    console.error('[digest] Error: Missing API key. Set GEMINI_API_KEY and/or OPENAI_API_KEY.');
-    console.error('[digest] Gemini key: https://aistudio.google.com/apikey');
+  const apiKey = await loadApiKey();
+  if (!apiKey) {
+    console.error('[digest] Error: MINIMAX_API_KEY not found.');
+    console.error('[digest] Set it via environment variable or ~/.ai-digest/config.json');
+    console.error('[digest] Get one at: https://platform.minimaxi.com');
     process.exit(1);
   }
-
-  const aiClient = createAIClient({
-    geminiApiKey,
-    openaiApiKey,
-    openaiApiBase,
-    openaiModel,
-  });
   
   if (!outputPath) {
     const dateStr = new Date().toISOString().slice(0, 10).replace(/-/g, '');
-    outputPath = `./digest-${dateStr}.md`;
+    outputPath = `./output/digest-${dateStr}.md`;
   }
   
   console.log(`[digest] === AI Daily Digest ===`);
@@ -1074,36 +1072,19 @@ async function main(): Promise<void> {
   console.log(`[digest] Top N: ${topN}`);
   console.log(`[digest] Language: ${lang}`);
   console.log(`[digest] Output: ${outputPath}`);
-  console.log(`[digest] AI provider: ${geminiApiKey ? 'Gemini (primary)' : 'OpenAI-compatible (primary)'}`);
-  if (openaiApiKey) {
-    const resolvedBase = (openaiApiBase?.trim() || OPENAI_DEFAULT_API_BASE).replace(/\/+$/, '');
-    const resolvedModel = openaiModel?.trim() || inferOpenAIModel(resolvedBase);
-    console.log(`[digest] Fallback: ${resolvedBase} (model=${resolvedModel})`);
-  }
   console.log('');
   
-  console.log(`[digest] Step 1/5: Fetching ${RSS_FEEDS.length} RSS feeds...`);
-  const allArticles = await fetchAllFeeds(RSS_FEEDS);
-  
-  if (allArticles.length === 0) {
-    console.error('[digest] Error: No articles fetched from any feed. Check network connection.');
-    process.exit(1);
-  }
-  
-  console.log(`[digest] Step 2/5: Filtering by time range (${hours} hours)...`);
-  const cutoffTime = new Date(Date.now() - hours * 60 * 60 * 1000);
-  const recentArticles = allArticles.filter(a => a.pubDate.getTime() > cutoffTime.getTime());
-  
-  console.log(`[digest] Found ${recentArticles.length} articles within last ${hours} hours`);
-  
+  console.log(`[digest] Step 1/4: Fetching articles from fusion (last ${hours} hours)...`);
+  const recentArticles = await fetchAllFeeds(hours);
+
   if (recentArticles.length === 0) {
     console.error(`[digest] Error: No articles found within the last ${hours} hours.`);
     console.error(`[digest] Try increasing --hours (e.g., --hours 168 for one week)`);
     process.exit(1);
   }
   
-  console.log(`[digest] Step 3/5: AI scoring ${recentArticles.length} articles...`);
-  const scores = await scoreArticlesWithAI(recentArticles, aiClient);
+  console.log(`[digest] Step 2/4: AI scoring ${recentArticles.length} articles...`);
+  const scores = await scoreArticlesWithAI(recentArticles, apiKey);
   
   const scoredArticles = recentArticles.map((article, index) => {
     const score = scores.get(index) || { relevance: 5, quality: 5, timeliness: 5, category: 'other' as CategoryId, keywords: [] };
@@ -1119,9 +1100,24 @@ async function main(): Promise<void> {
   
   console.log(`[digest] Top ${topN} articles selected (score range: ${topArticles[topArticles.length - 1]?.totalScore || 0} - ${topArticles[0]?.totalScore || 0})`);
   
-  console.log(`[digest] Step 4/5: Generating AI summaries...`);
+  console.log(`[digest] Step 3/4: Fetching content for top ${topN} articles...`);
+  // Fetch content for top articles to enable better summarization
+  // Process sequentially to avoid overwhelming the network
+  let fetchedCount = 0;
+  for (const article of topArticles) {
+    if (!article.description || article.description.length < 100) {
+      const content = await fetchArticleContent(article.link);
+      if (content) {
+        article.description = content;
+        fetchedCount++;
+      }
+    }
+  }
+  console.log(`[digest] ✓ Fetched content for ${fetchedCount}/${topN} articles`);
+  
+  console.log(`[digest] Step 4/4: Generating AI summaries & highlights...`);
   const indexedTopArticles = topArticles.map((a, i) => ({ ...a, index: i }));
-  const summaries = await summarizeArticles(indexedTopArticles, aiClient, lang);
+  const summaries = await summarizeArticles(indexedTopArticles, apiKey, lang);
   
   const finalArticles: ScoredArticle[] = topArticles.map((a, i) => {
     const sm = summaries.get(i) || { titleZh: a.title, summary: a.description.slice(0, 200), reason: '' };
@@ -1146,27 +1142,26 @@ async function main(): Promise<void> {
     };
   });
   
-  console.log(`[digest] Step 5/5: Generating today's highlights...`);
-  const highlights = await generateHighlights(finalArticles, aiClient, lang);
+  const highlights = await generateHighlights(finalArticles, apiKey, lang);
   
-  const successfulSources = new Set(allArticles.map(a => a.sourceName));
+  const successfulSources = new Set(recentArticles.map(a => a.sourceName));
   
   const report = generateDigestReport(finalArticles, highlights, {
-    totalFeeds: RSS_FEEDS.length,
+    totalFeeds: successfulSources.size,
     successFeeds: successfulSources.size,
-    totalArticles: allArticles.length,
+    totalArticles: recentArticles.length,
     filteredArticles: recentArticles.length,
     hours,
     lang,
   });
-  
+
   await mkdir(dirname(outputPath), { recursive: true });
   await writeFile(outputPath, report);
-  
+
   console.log('');
   console.log(`[digest] ✅ Done!`);
   console.log(`[digest] 📁 Report: ${outputPath}`);
-  console.log(`[digest] 📊 Stats: ${successfulSources.size} sources → ${allArticles.length} articles → ${recentArticles.length} recent → ${finalArticles.length} selected`);
+  console.log(`[digest] 📊 Stats: ${successfulSources.size} sources → ${recentArticles.length} articles → ${finalArticles.length} selected`);
   
   if (finalArticles.length > 0) {
     console.log('');

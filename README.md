@@ -1,10 +1,19 @@
-# AI Daily Digest
+# AI Digest
+
+Fork 说明：
+1. 不再支持 RSS 数据源的实时，改从 Fusion 的数据库读取————所以需要先运行 [Fusion](https://github.com/0x2e/fusion) 才能使用本项目。
+2. 项目结构尽量与原项目保持一致，方便后续维护和扩展。
+3. 可以复用 Fusion 的优点。
+
+---
+
+## 原本介绍
 
 skill 制作详情可查看 ➡️ https://mp.weixin.qq.com/s/rkQ28KTZs5QeZqjwSCvR4Q
 
-从 [Andrej Karpathy](https://x.com/karpathy) 推荐的 90 个 Hacker News 顶级技术博客中抓取最新文章，通过 AI 多维评分筛选，生成一份结构化的每日精选日报。默认使用 Gemini，并支持自动降级到 OpenAI 兼容 API。
+从 [Andrej Karpathy](https://x.com/karpathy) 推荐的 90 个 Hacker News 顶级技术博客中抓取最新文章，通过 MiniMax AI 多维评分筛选，生成一份结构化的每日精选日报。
 
-![AI Daily Digest 概览](assets/overview.png)
+![AI Digest 概览](assets/overview.png)
 
 > 信息源来自 [Hacker News Popularity Contest 2025](https://refactoringenglish.com/tools/hn-popularity/)，涵盖 simonwillison.net、paulgraham.com、overreacted.io、gwern.net、krebsonsecurity.com 等。
 
@@ -23,17 +32,14 @@ Agent 会依次询问：
 | 时间范围 | 24h / 48h / 72h / 7天 | 48h |
 | 精选数量 | 10 / 15 / 20 篇 | 15 篇 |
 | 输出语言 | 中文 / English | 中文 |
-| Gemini API Key | 手动输入（首次需要，之后自动记忆） | — |
+| MiniMax API Key | 手动输入（首次需要，之后自动记忆） | — |
 
-配置会自动保存到 `~/.hn-daily-digest/config.json`，下次运行可一键复用。
+配置会自动保存到 `~/.ai-digest/config.json`，下次运行可一键复用。
 
 ### 直接命令行运行
 
 ```bash
-export GEMINI_API_KEY="your-key"
-export OPENAI_API_KEY="your-openai-compatible-key"  # 可选，Gemini 失败时兜底
-export OPENAI_API_BASE="https://api.deepseek.com/v1" # 可选，默认 https://api.openai.com/v1
-export OPENAI_MODEL="deepseek-chat"                  # 可选，不填会自动推断
+export MINIMAX_API_KEY="your-key"
 npx -y bun scripts/digest.ts --hours 48 --top-n 15 --lang zh --output ./digest.md
 ```
 
@@ -47,7 +53,7 @@ RSS 抓取 → 时间过滤 → AI 评分+分类 → AI 摘要+翻译 → 趋势
 
 1. **RSS 抓取** — 并发抓取 90 个源（10 路并发，15s 超时），兼容 RSS 2.0 和 Atom 格式
 2. **时间过滤** — 按指定时间窗口筛选近期文章
-3. **AI 评分** — AI 从相关性、质量、时效性三个维度打分（1-10），同时完成分类和关键词提取（Gemini 优先，失败自动降级到 OpenAI 兼容接口）
+3. **AI 评分** — MiniMax 从相关性、质量、时效性三个维度打分（1-10），同时完成分类和关键词提取
 4. **AI 摘要** — 为 Top N 文章生成结构化摘要（4-6 句）、中文标题翻译、推荐理由
 5. **趋势总结** — AI 归纳当日技术圈 2-3 个宏观趋势
 
@@ -86,56 +92,8 @@ RSS 抓取 → 时间过滤 → AI 评分+分类 → AI 摘要+翻译 → 趋势
 ## 环境要求
 
 - [Bun](https://bun.sh) 运行时（通过 `npx -y bun` 自动安装）
-- 至少一个可用的 AI API Key：
-  - `GEMINI_API_KEY`（[免费获取](https://aistudio.google.com/apikey)）
-  - 或 `OPENAI_API_KEY`（可配合 `OPENAI_API_BASE` 使用 DeepSeek / OpenAI 等 OpenAI 兼容服务）
+- MiniMax API Key（[免费获取](https://platform.minimaxi.com)）
 - 网络连接
-
-## 切换 AI 模型提供商
-
-本项目默认使用 Gemini API（免费），如果你希望替换为其他模型提供商（如 OpenAI、Anthropic、DeepSeek、通义千问等），可以借助 AI 编码助手一键完成。
-
-### 方法：让 AI 帮你改
-
-在你使用的 AI 编码工具（如 Claude Code、Cursor、GitHub Copilot 等）中，直接发送以下 prompt：
-
-```
-请修改 scripts/digest.ts，将 AI 提供商从 Gemini 替换为 [你想用的提供商]。
-
-需要修改的部分：
-1. 常量 GEMINI_API_URL（第 9 行）— 替换为目标 API 的 endpoint
-2. 函数 callGemini（约第 363 行）— 修改 request body 格式和 response 解析逻辑以适配目标 API
-3. 环境变量名 GEMINI_API_KEY — 改为对应的 key 名称（如 OPENAI_API_KEY）
-4. SKILL.md 和 README.md 中的相关说明文字
-
-要求：
-- 保持函数签名不变（输入 prompt 字符串，返回 string）
-- 保持 temperature 等参数的语义等价
-- 更新 CLI 帮助文本和错误提示中的 key 名称
-```
-
-### 改动范围说明
-
-整个项目只有一个脚本文件 `scripts/digest.ts`，AI 调用逻辑集中在两处：
-
-| 位置 | 说明 |
-|------|------|
-| `GEMINI_API_URL` 常量 | API endpoint 地址 |
-| `callGemini()` 函数 | 请求构造 + 响应解析，约 25 行代码 |
-
-其余所有代码（RSS 抓取、评分 prompt、摘要 prompt、报告生成）均与 AI 提供商无关，无需修改。Prompt 内容本身是通用的，切换模型后可以直接复用。
-
-### 常见替换示例
-
-| 提供商 | API Endpoint | Key 环境变量 |
-|--------|-------------|-------------|
-| OpenAI | `https://api.openai.com/v1/chat/completions` | `OPENAI_API_KEY` |
-| Anthropic | `https://api.anthropic.com/v1/messages` | `ANTHROPIC_API_KEY` |
-| DeepSeek | `https://api.deepseek.com/v1/chat/completions` | `DEEPSEEK_API_KEY` |
-| 通义千问 | `https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions` | `DASHSCOPE_API_KEY` |
-| OpenAI 兼容 API | 自定义 endpoint | 自定义 |
-
-> 💡 如果目标提供商兼容 OpenAI API 格式（如 DeepSeek、Groq、Together AI 等），改动量更小 — 只需换 URL 和 Key，request/response 格式相同。
 
 ## 信息源
 
