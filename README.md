@@ -34,24 +34,27 @@ Agent 会依次询问：
 | 输出语言 | 中文 / English | 中文 |
 | MiniMax API Key | 手动输入（首次需要，之后自动记忆） | — |
 
-配置会自动保存到 `~/.ai-digest/config.json`，下次运行可一键复用。
+配置会自动保存到 `~/.ai-digest/config.json`（含 `fusionDbPath`、`outputDir` 等字段），下次运行可一键复用。
 
 ### 直接命令行运行
 
 ```bash
 export MINIMAX_API_KEY="your-key"
-npx -y bun scripts/digest.ts --hours 48 --top-n 15 --lang zh --output ./digest.md
+export FUSION_DB_PATH="/path/to/fusion.db"  # 可选，默认 ~/apps/fusion/fusion.db
+npx -y bun scripts/digest.ts --hours 48 --top-n 15 --lang zh --output ./output/digest.md
 ```
+
+脚本启动时会读取 `~/.ai-digest/config.json`，CLI 参数优先级高于配置文件。
 
 ## 功能
 
 ### 五步处理流水线
 
 ```
-RSS 抓取 → 时间过滤 → AI 评分+分类 → AI 摘要+翻译 → 趋势总结
+Fusion DB → 时间过滤 → AI 评分+分类 → AI 摘要+翻译 → 趋势总结
 ```
 
-1. **RSS 抓取** — 并发抓取 90 个源（10 路并发，15s 超时），兼容 RSS 2.0 和 Atom 格式
+1. **数据获取** — 优先从 [Fusion](https://github.com/0x2e/fusion) SQLite 数据库读取文章；若数据库不可用则回退到直接抓取 90 个 RSS 源（10 路并发，15s 超时），兼容 RSS 2.0 和 Atom 格式
 2. **时间过滤** — 按指定时间窗口筛选近期文章
 3. **AI 评分** — MiniMax 从相关性、质量、时效性三个维度打分（1-10），同时完成分类和关键词提取
 4. **AI 摘要** — 为 Top N 文章生成结构化摘要（4-6 句）、中文标题翻译、推荐理由
@@ -81,7 +84,7 @@ RSS 抓取 → 时间过滤 → AI 评分+分类 → AI 摘要+翻译 → 趋势
 
 ## 亮点
 
-- **零依赖** — 纯 TypeScript 单文件，无第三方库，基于 Bun 运行时的原生 `fetch` 和内置 XML 解析
+- **零依赖** — 纯 TypeScript 单文件，无第三方库，基于 Bun 运行时的原生 `fetch`、`bun:sqlite` 和内置 XML 解析
 - **中英双语** — 所有标题自动翻译为中文，原文标题保留为链接文字，不错过任何语境
 - **结构化摘要** — 不是一句话敷衍了事，而是 4-6 句覆盖核心问题→关键论点→结论的完整概述，30 秒判断一篇文章是否值得读
 - **可视化统计** — Mermaid 图表（GitHub/Obsidian 原生渲染）+ ASCII 柱状图（终端友好）+ 标签云，三种方式覆盖所有阅读场景
@@ -92,6 +95,7 @@ RSS 抓取 → 时间过滤 → AI 评分+分类 → AI 摘要+翻译 → 趋势
 ## 环境要求
 
 - [Bun](https://bun.sh) 运行时（通过 `npx -y bun` 自动安装）
+- [Fusion](https://github.com/0x2e/fusion) SQLite 数据库可访问（通过 `FUSION_DB_PATH` 环境变量或配置文件 `fusionDbPath` 字段指定路径，未配置时自动回退到直接抓取 RSS 源）
 - MiniMax API Key（[免费获取](https://platform.minimaxi.com)）
 - 网络连接
 

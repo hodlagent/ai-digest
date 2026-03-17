@@ -45,7 +45,10 @@ FUSION_PASSWORD="fusion" ./fusion
 - 数据存储在 SQLite，默认路径 `/data/fusion.db`（Docker）或当前目录
 
 **数据库路径配置**:
-脚本通过 `FUSION_DB_PATH` 环境变量指定 fusion 数据库路径，默认 `~/apps/fusion/fusion.db`。
+脚本通过以下方式获取 fusion 数据库路径（优先级从高到低）：
+1. `FUSION_DB_PATH` 环境变量
+2. 配置文件 `~/.ai-digest/config.json` 中的 `fusionDbPath` 字段
+3. 默认路径 `~/apps/fusion/fusion.db`
 
 ## 命令
 
@@ -84,6 +87,8 @@ Agent 在执行前**必须检查**此文件是否存在：
 ```json
 {
   "minimaxApiKey": "",
+  "fusionDbPath": "/Users/hodlagent/apps/fusion/fusion.db",
+  "outputDir": "./output",
   "timeRange": 48,
   "topN": 15,
   "language": "zh",
@@ -115,7 +120,7 @@ cat ~/.ai-digest/config.json 2>/dev/null || echo "NO_CONFIG"
 question({
   questions: [{
     header: "使用已保存配置",
-    question: "检测到上次使用的配置：\n\n• 时间范围: ${config.timeRange}小时\n• 精选数量: ${config.topN} 篇\n• 输出语言: ${config.language === 'zh' ? '中文' : 'English'}\n\n请选择操作：",
+    question: "检测到上次使用的配置：\n\n• 数据库路径: ${config.fusionDbPath}\n• 输出目录: ${config.outputDir}\n• 时间范围: ${config.timeRange}小时\n• 精选数量: ${config.topN} 篇\n• 输出语言: ${config.language === 'zh' ? '中文' : 'English'}\n\n请选择操作：",
     options: [
       { label: "使用上次配置直接运行 (Recommended)", description: "使用所有已保存的参数立即开始" },
       { label: "重新配置", description: "从头开始配置所有参数" }
@@ -181,15 +186,16 @@ question({
 ### Step 2: 执行脚本
 
 ```bash
-cd ${SKILL_DIR} && mkdir -p output
+cd ${SKILL_DIR} && mkdir -p ${outputDir}
 
 export MINIMAX_API_KEY="<key>"
+export FUSION_DB_PATH="<fusionDbPath>"
 
 bun scripts/digest.ts \
   --hours <timeRange> \
   --top-n <topN> \
   --lang <zh|en> \
-  --output ./output/digest-$(date +%Y%m%d).md
+  --output ${outputDir}/digest-$(date +%Y%m%d).md
 ```
 
 **注意**: 脚本直接读取 fusion 的 SQLite 数据库，确保 fusion 已部署并添加了 RSS 源。可通过 `FUSION_DB_PATH` 环境变量指定数据库路径。
@@ -201,6 +207,8 @@ mkdir -p ~/.ai-digest
 cat > ~/.ai-digest/config.json << 'EOF'
 {
   "minimaxApiKey": "<key>",
+  "fusionDbPath": "<dbPath>",
+  "outputDir": "<outputDir>",
   "timeRange": <hours>,
   "topN": <topN>,
   "language": "<zh|en>",
@@ -248,7 +256,7 @@ EOF
 
 - `bun` 运行时（通过 `npx -y bun` 自动安装）
 - MINIMAX_API_KEY 环境变量或 `~/.ai-digest/config.json` 配置
-- fusion SQLite 数据库可访问（通过 `FUSION_DB_PATH` 或默认路径）
+- fusion SQLite 数据库可访问（通过 `FUSION_DB_PATH` 环境变量或配置文件 `fusionDbPath` 字段）
 - 网络访问（需要能访问 MiniMax API；代理环境下脚本自动处理 `https_proxy` → `HTTPS_PROXY`）
 
 ---

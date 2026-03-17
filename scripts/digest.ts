@@ -1,4 +1,5 @@
 import { writeFile, mkdir, readFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import process from 'node:process';
 import { Database } from 'bun:sqlite';
@@ -168,6 +169,16 @@ interface MinimaxSummaryResult {
   }>;
 }
 
+interface IConfig {
+  minimaxApiKey?: string;
+  fusionDbPath?: string;
+  outputDir?: string;
+  timeRange?: number;
+  topN?: number;
+  language?: string;
+  lastUsed?: string;
+}
+
 // ============================================================================
 // RSS/Atom Parsing (using Bun's built-in HTMLRewriter or manual XML parsing)
 // ============================================================================
@@ -331,17 +342,20 @@ function extractMainContent(html: string): string {
 // Config
 // ============================================================================
 
+async function loadConfig() : Promise<IConfig> {
+  const configPath = join(homedir(), '.ai-digest', 'config.json');
+  const content = await readFile(configPath, 'utf-8');
+  const config = JSON.parse(content) as IConfig;
+  return config;
+}
+
 async function loadApiKey(): Promise<string | undefined> {
-  // 1. Environment variable
   if (process.env.MINIMAX_API_KEY) {
     return process.env.MINIMAX_API_KEY;
   }
 
-  // 2. Config file: ~/.ai-digest/config.json
   try {
-    const configPath = join(homedir(), '.ai-digest', 'config.json');
-    const content = await readFile(configPath, 'utf-8');
-    const config = JSON.parse(content) as { minimaxApiKey?: string };
+    const config = await loadConfig();
     if (config.minimaxApiKey) {
       console.log('[digest] Loaded API key from ~/.ai-digest/config.json');
       return config.minimaxApiKey;
@@ -354,11 +368,86 @@ async function loadApiKey(): Promise<string | undefined> {
 }
 
 // ============================================================================
+// Feed Fetching - Original/Directly
+// ============================================================================
+
+async function fetchFeed(feed: { name: string; xmlUrl: string; htmlUrl: string }): Promise<Article[]> {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), FEED_FETCH_TIMEOUT_MS);
+    
+    const response = await fetch(feed.xmlUrl, {
+      signal: controller.signal,
+      headers: {
+        'User-Agent': 'AI-Daily-Digest/1.0 (RSS Reader)',
+        'Accept': 'application/rss+xml, application/atom+xml, application/xml, text/xml, */*',
+      },
+    });
+    
+    clearTimeout(timeout);
+    
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    
+    const xml = await response.text();
+    const items = parseRSSItems(xml);
+    
+    return items.map(item => ({
+      title: item.title,
+      link: item.link,
+      pubDate: parseDate(item.pubDate) || new Date(0),
+      description: item.description,
+      sourceName: feed.name,
+      sourceUrl: feed.htmlUrl,
+    }));
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    // Only log non-abort errors to reduce noise
+    if (!msg.includes('abort')) {
+      console.warn(`[digest] ✗ ${feed.name}: ${msg}`);
+    } else {
+      console.warn(`[digest] ✗ ${feed.name}: timeout`);
+    }
+    return [];
+  }
+}
+
+async function fetchAllFeedsDirectly(hours: number): Promise<Article[]> {
+  const feeds: typeof RSS_FEEDS = RSS_FEEDS;
+  const allArticles: Article[] = [];
+  let successCount = 0;
+  let failCount = 0;
+  const cutoff = Date.now() - hours * 3_600_000;
+
+  for (let i = 0; i < feeds.length; i += FEED_CONCURRENCY) {
+    const batch = feeds.slice(i, i + FEED_CONCURRENCY);
+    const results = await Promise.allSettled(batch.map(fetchFeed));
+    
+    for (const result of results) {
+      if (result.status === 'fulfilled' && result.value.length > 0) {
+        allArticles.push(...result.value);
+        successCount++;
+      } else {
+        failCount++;
+      }
+    }
+    
+    const progress = Math.min(i + FEED_CONCURRENCY, feeds.length);
+    console.log(`[digest] Progress: ${progress}/${feeds.length} feeds processed (${successCount} ok, ${failCount} failed)`);
+  }
+
+  const filtered = allArticles.filter(a => a.pubDate.getTime() >= cutoff);
+  console.log(`[digest] Fetched ${filtered.length} articles from ${successCount} feeds (${failCount} failed, last ${hours}h)`);
+  return filtered;
+}
+
+// ============================================================================
 // Fusion Integration
 // ============================================================================
 
-async function fetchFromFusion(hours: number): Promise<Article[]> {
-  const dbPath = process.env.FUSION_DB_PATH || '/Users/jerin/apps/fusion/fusion.db';
+async function fetchFromFusion(hours: number, config?: IConfig): Promise<Article[]> {
+  const dbPath = config?.fusionDbPath || process.env.FUSION_DB_PATH || '/Users/hodlagent/apps/fusion/fusion.db';
   console.log(`[digest] Connecting to fusion database: ${dbPath}`);
 
   const db = new Database(dbPath);
@@ -406,10 +495,19 @@ async function fetchFromFusion(hours: number): Promise<Article[]> {
   }
 }
 
-async function fetchAllFeeds(hours: number): Promise<Article[]> {
-  console.log('[digest] Fetching articles from fusion database...');
-  const articles = await fetchFromFusion(hours);
-  console.log(`[digest] ✓ Fetched ${articles.length} articles from fusion database`);
+async function fetchAllFeeds(hours: number, config?: IConfig): Promise<Article[]> {
+  const dbPath = config?.fusionDbPath || process.env.FUSION_DB_PATH || '/Users/hodlagent/apps/fusion/fusion.db';
+
+  if (existsSync(dbPath)) {
+    console.log('[digest] Fetching articles from fusion database...');
+    const articles = await fetchFromFusion(hours, config);
+    console.log(`[digest] ✓ Fetched ${articles.length} articles from fusion database`);
+    return articles;
+  }
+
+  console.log('[digest] Fusion database not found, fetching feeds directly...');
+  const articles = await fetchAllFeedsDirectly(hours);
+  console.log(`[digest] ✓ Fetched ${articles.length} articles directly from RSS feeds`);
   return articles;
 }
 
@@ -1036,11 +1134,29 @@ async function main(): Promise<void> {
   const args = process.argv.slice(2);
   if (args.includes('--help') || args.includes('-h')) printUsage();
   
-  let hours = 48;
-  let topN = 15;
-  let lang: 'zh' | 'en' = 'zh';
+  // Load config file
+  let config: IConfig | undefined;
+  try {
+    config = await loadConfig();
+    console.log('[digest] Loaded config from ~/.ai-digest/config.json');
+  } catch {
+    // Config file not found, will use defaults and env vars
+  }
+
+  const apiKey = config?.minimaxApiKey || await loadApiKey();
+  if (!apiKey) {
+    console.error('[digest] Error: MINIMAX_API_KEY not found.');
+    console.error('[digest] Set it via environment variable or ~/.ai-digest/config.json');
+    console.error('[digest] Get one at: https://platform.minimaxi.com');
+    process.exit(1);
+  }
+
+  let hours = config?.timeRange ?? 48;
+  let topN = config?.topN ?? 15;
+  let lang: 'zh' | 'en' = (config?.language as 'zh' | 'en') ?? 'zh';
   let outputPath = '';
-  
+
+  // CLI args override config file values
   for (let i = 0; i < args.length; i++) {
     const arg = args[i]!;
     if (arg === '--hours' && args[i + 1]) {
@@ -1053,18 +1169,11 @@ async function main(): Promise<void> {
       outputPath = args[++i]!;
     }
   }
-  
-  const apiKey = await loadApiKey();
-  if (!apiKey) {
-    console.error('[digest] Error: MINIMAX_API_KEY not found.');
-    console.error('[digest] Set it via environment variable or ~/.ai-digest/config.json');
-    console.error('[digest] Get one at: https://platform.minimaxi.com');
-    process.exit(1);
-  }
-  
+
   if (!outputPath) {
     const dateStr = new Date().toISOString().slice(0, 10).replace(/-/g, '');
-    outputPath = `./output/digest-${dateStr}.md`;
+    const outputDir = config?.outputDir ?? './output';
+    outputPath = `${outputDir}/digest-${dateStr}.md`;
   }
   
   console.log(`[digest] === AI Daily Digest ===`);
@@ -1075,7 +1184,7 @@ async function main(): Promise<void> {
   console.log('');
   
   console.log(`[digest] Step 1/4: Fetching articles from fusion (last ${hours} hours)...`);
-  const recentArticles = await fetchAllFeeds(hours);
+  const recentArticles = await fetchAllFeeds(hours, config);
 
   if (recentArticles.length === 0) {
     console.error(`[digest] Error: No articles found within the last ${hours} hours.`);
