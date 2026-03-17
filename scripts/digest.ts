@@ -12,8 +12,9 @@ import { homedir } from 'node:os';
 const MINIMAX_API_URL = 'https://api.minimax.chat/v1/text/chatcompletion_v2';
 const FEED_FETCH_TIMEOUT_MS = 15_000;
 const FEED_CONCURRENCY = 10;
-const MINIMAX_BATCH_SIZE = 8;
+const MINIMAX_BATCH_SIZE = 5;
 const MAX_CONCURRENT_MINIMAX = 3;
+const DESCRIPTION_MAX_LEN = 384;
 
 // 90 RSS feeds from Hacker News Popularity Contest 2025 (curated by Karpathy)
 const RSS_FEEDS: Array<{ name: string; xmlUrl: string; htmlUrl: string }> = [
@@ -196,6 +197,18 @@ function stripHtml(html: string): string {
     .trim();
 }
 
+function truncateWords(text: string, maxLen: number): string {
+  if (text.length <= maxLen) return text;
+  const sliced = text.slice(0, maxLen);
+  // 1. Try sentence boundary: last . ! ? 。 ！ ？
+  const sentence = sliced.match(/^(.*[.!?。！？])/);
+  if (sentence) return sentence[1].trimEnd();
+  // 2. Fallback to last space
+  const lastSpace = sliced.lastIndexOf(' ');
+  if (lastSpace > maxLen * 0.6) return sliced.slice(0, lastSpace);
+  return sliced;
+}
+
 function extractCDATA(text: string): string {
   const cdataMatch = text.match(/<!\[CDATA\[([\s\S]*?)\]\]>/);
   return cdataMatch ? cdataMatch[1] : text;
@@ -269,8 +282,7 @@ function parseRSSItems(xml: string): Array<{ title: string; link: string; pubDat
       );
       
       if (title || link) {
-        items.push({ title, link, pubDate, description: description.slice(0, 500) });
-      }
+        items.push({ title, link, pubDate, description: truncateWords(description, DESCRIPTION_MAX_LEN) });      }
     }
   } else {
     // RSS format: <item>
@@ -289,8 +301,7 @@ function parseRSSItems(xml: string): Array<{ title: string; link: string; pubDat
       );
       
       if (title || link) {
-        items.push({ title, link, pubDate, description: description.slice(0, 500) });
-      }
+        items.push({ title, link, pubDate, description: truncateWords(description, DESCRIPTION_MAX_LEN) });      }
     }
   }
   
@@ -447,7 +458,7 @@ async function fetchAllFeedsDirectly(hours: number): Promise<Article[]> {
 // ============================================================================
 
 async function fetchFromFusion(hours: number, config?: IConfig): Promise<Article[]> {
-  const dbPath = config?.fusionDbPath || process.env.FUSION_DB_PATH || '/Users/hodlagent/apps/fusion/fusion.db';
+  const dbPath = config?.fusionDbPath || process.env.FUSION_DB_PATH || '/Users/jerin/apps/fusion/fusion.db';
   console.log(`[digest] Connecting to fusion database: ${dbPath}`);
 
   const db = new Database(dbPath);
@@ -496,7 +507,7 @@ async function fetchFromFusion(hours: number, config?: IConfig): Promise<Article
 }
 
 async function fetchAllFeeds(hours: number, config?: IConfig): Promise<Article[]> {
-  const dbPath = config?.fusionDbPath || process.env.FUSION_DB_PATH || '/Users/hodlagent/apps/fusion/fusion.db';
+  const dbPath = config?.fusionDbPath || process.env.FUSION_DB_PATH || '/Users/jerin/apps/fusion/fusion.db';
 
   if (existsSync(dbPath)) {
     console.log('[digest] Fetching articles from fusion database...');
@@ -538,7 +549,7 @@ async function callMinimax(prompt: string, apiKey: string, model: string = 'Mini
             { role: 'user', content: [{ type: 'text', text: prompt }] }
           ],
           temperature: 0.3,
-          max_tokens: 8192,
+          max_tokens: 32768,
         }),
         signal: AbortSignal.timeout(90_000),
       });
@@ -578,19 +589,70 @@ async function callMinimax(prompt: string, apiKey: string, model: string = 'Mini
 }
 
 function parseJsonResponse<T>(text: string): T {
-  let jsonText = text.trim();
+  // Replace Chinese/smart quotes with regular quotes inside JSON-safe HTML entities
+  // to prevent them from being mistaken for JSON string delimiters
+  let jsonText = text
+    .replace(/\u201C/g, '\uFF02')  // " → ＂
+    .replace(/\u201D/g, '\uFF02')  // " → ＂
+    .replace(/\u2018/g, '\uFF07')  // ' → ＇
+    .replace(/\u2019/g, '\uFF07')  // ' → ＇
+    .trim();
   // Strip markdown code blocks if present
   if (jsonText.startsWith('```')) {
     jsonText = jsonText.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '').trim();
   }
-  // Try to extract JSON object from response if it's not pure JSON
-  if (!jsonText.startsWith('{')) {
-    const match = jsonText.match(/\{[\s\S]*\}/);
-    if (match) {
-      jsonText = match[0];
+  // Also strip trailing ``` that may appear mid-stream
+  const trailingFence = jsonText.indexOf('\n```');
+  if (trailingFence > 0) jsonText = jsonText.slice(0, trailingFence).trim();
+  // Extract JSON object: find first { and its matching }
+  const firstBrace = jsonText.indexOf('{');
+  if (firstBrace >= 0) {
+    let depth = 0;
+    let end = -1;
+    let inString = false;
+    for (let i = firstBrace; i < jsonText.length; i++) {
+      const ch = jsonText[i];
+      if (inString) {
+        if (ch === '\\' && i + 1 < jsonText.length) { i++; continue; }
+        if (ch === '"') inString = false;
+      } else {
+        if (ch === '"') inString = true;
+        else if (ch === '{') depth++;
+        else if (ch === '}') { depth--; if (depth === 0) { end = i; break; } }
+      }
+    }
+    if (end >= 0) {
+      jsonText = jsonText.slice(firstBrace, end + 1);
+    } else {
+      jsonText = jsonText.slice(firstBrace); // truncated, will try repair below
     }
   }
-  return JSON.parse(jsonText) as T;
+  try {
+    return JSON.parse(jsonText) as T;
+  } catch {
+    // Attempt to repair truncated JSON
+    let repaired = jsonText;
+    const quotes = (repaired.match(/"/g) || []).length;
+    if (quotes % 2 !== 0) repaired += '"';
+    const stack: string[] = [];
+    let str = false;
+    for (let i = 0; i < repaired.length; i++) {
+      const ch = repaired[i];
+      if (str) {
+        if (ch === '\\' && i + 1 < repaired.length) { i++; continue; }
+        if (ch === '"') str = false;
+      } else {
+        if (ch === '"') str = true;
+        else if (ch === '{' || ch === '[') stack.push(ch);
+        else if (ch === '}') { if (stack[stack.length - 1] === '{') stack.pop(); }
+        else if (ch === ']') { if (stack[stack.length - 1] === '[') stack.pop(); }
+      }
+    }
+    for (let i = stack.length - 1; i >= 0; i--) {
+      repaired += stack[i] === '{' ? '}' : ']';
+    }
+    return JSON.parse(repaired) as T;
+  }
 }
 
 // ============================================================================
@@ -599,7 +661,7 @@ function parseJsonResponse<T>(text: string): T {
 
 function buildScoringPrompt(articles: Array<{ index: number; title: string; description: string; sourceName: string }>): string {
   const articlesList = articles.map(a =>
-    `Index ${a.index}: [${a.sourceName}] ${a.title}\n${a.description.slice(0, 300)}`
+    `Index ${a.index}: [${a.sourceName}] ${a.title}\n${truncateWords(a.description, DESCRIPTION_MAX_LEN)}`
   ).join('\n\n---\n\n');
 
   return `你是一个技术内容策展人，正在为一份面向技术爱好者的每日精选摘要筛选文章。
@@ -681,9 +743,10 @@ async function scoreArticlesWithAI(
   for (let i = 0; i < batches.length; i += MAX_CONCURRENT_MINIMAX) {
     const batchGroup = batches.slice(i, i + MAX_CONCURRENT_MINIMAX);
     const promises = batchGroup.map(async (batch) => {
+      let responseText: string | undefined;
       try {
         const prompt = buildScoringPrompt(batch);
-        const responseText = await callMinimax(prompt, apiKey);
+        responseText = await callMinimax(prompt, apiKey);
         const parsed = parseJsonResponse<MinimaxScoringResult>(responseText);
         
         if (parsed.results && Array.isArray(parsed.results)) {
@@ -701,6 +764,9 @@ async function scoreArticlesWithAI(
         }
       } catch (error) {
         console.warn(`[digest] Scoring batch failed: ${error instanceof Error ? error.message : String(error)}`);
+        if (error instanceof SyntaxError || (error instanceof Error && error.message.includes('JSON'))) {
+          console.warn(`[digest] [DEBUG] Raw response (first 500 chars):\n${responseText?.slice(0, 500)}`);
+        }
         for (const item of batch) {
           allScores.set(item.index, { relevance: 5, quality: 5, timeliness: 5, category: 'other', keywords: [] });
         }
@@ -723,7 +789,7 @@ function buildSummaryPrompt(
   lang: 'zh' | 'en'
 ): string {
   const articlesList = articles.map(a =>
-    `Index ${a.index}: [${a.sourceName}] ${a.title}\n${a.description.slice(0, 600)}`
+    `Index ${a.index}: [${a.sourceName}] ${a.title}\n${truncateWords(a.description, 600)}`
   ).join('\n\n---\n\n');
 
   const langInstruction = lang === 'zh'
@@ -790,9 +856,10 @@ async function summarizeArticles(
   for (let i = 0; i < batches.length; i += MAX_CONCURRENT_MINIMAX) {
     const batchGroup = batches.slice(i, i + MAX_CONCURRENT_MINIMAX);
     const promises = batchGroup.map(async (batch) => {
+      let responseText: string | undefined;
       try {
         const prompt = buildSummaryPrompt(batch, lang);
-        const responseText = await callMinimax(prompt, apiKey);
+        responseText = await callMinimax(prompt, apiKey);
         const parsed = parseJsonResponse<MinimaxSummaryResult>(responseText);
         
         if (parsed.results && Array.isArray(parsed.results)) {
@@ -800,20 +867,24 @@ async function summarizeArticles(
             const article = batch.find(a => a.index === result.index) || batch[0];
             summaries.set(result.index, {
               titleZh: result.titleZh || article.title,
-              summary: result.summary || article.description.slice(0, 300),
+              summary: result.summary || truncateWords(article.description, DESCRIPTION_MAX_LEN),
               reason: result.reason || '【AI摘要失败】',
             });
           }
         } else {
           console.warn(`[digest] Summary parse failed for batch, using fallbacks`);
+          console.warn(`[digest] [DEBUG] Raw response (first 500 chars):\n${responseText?.slice(0, 500)}`);
           for (const item of batch) {
-            summaries.set(item.index, { titleZh: item.title, summary: item.description.slice(0, 300), reason: '【AI解析失败】' });
+            summaries.set(item.index, { titleZh: item.title, summary: truncateWords(item.description, DESCRIPTION_MAX_LEN), reason: '【AI解析失败】' });
           }
         }
       } catch (error) {
         console.warn(`[digest] Summary batch failed: ${error instanceof Error ? error.message : String(error)}`);
+        if (error instanceof SyntaxError || (error instanceof Error && error.message.includes('JSON'))) {
+          console.warn(`[digest] [DEBUG] Raw response (first 500 chars):\n${responseText?.slice(0, 500)}`);
+        }
         for (const item of batch) {
-          summaries.set(item.index, { titleZh: item.title, summary: item.description.slice(0, 300), reason: '【AI摘要失败，使用原文描述】' });
+          summaries.set(item.index, { titleZh: item.title, summary: truncateWords(item.description, DESCRIPTION_MAX_LEN), reason: '【AI摘要失败，使用原文描述】' });
         }
       }
     });
@@ -995,7 +1066,7 @@ function generateDigestReport(articles: ScoredArticle[], highlights: string, sta
   const dateStr = now.toISOString().split('T')[0];
   
   let report = `# 📰 AI 博客每日精选 — ${dateStr}\n\n`;
-  report += `> 来自 blogwatcher 追踪的 ${stats.totalFeeds} 个技术博客，AI 精选 Top ${articles.length}\n\n`;
+  report += `> 来自 Fusion 追踪的 ${stats.totalFeeds} 个技术博客，AI 精选 Top ${articles.length}\n\n`;
 
   // ── Today's Highlights ──
   if (highlights) {
@@ -1086,8 +1157,7 @@ function generateDigestReport(articles: ScoredArticle[], highlights: string, sta
 
   // ── Footer ──
   report += `*生成于 ${dateStr} ${now.toISOString().split('T')[1]?.slice(0, 5) || ''} | 扫描 ${stats.successFeeds} 源 → 获取 ${stats.totalArticles} 篇 → 精选 ${articles.length} 篇*\n`;
-  report += `*基于 blogwatcher 聚合的 RSS 源，使用 MiniMax AI 智能筛选*\n`;
-  report += `*由「懂点儿AI」制作，欢迎关注同名微信公众号获取更多 AI 实用技巧 💡*\n`;
+  report += `*基于 Fusion 聚合的 RSS 源，使用 MiniMax AI 智能筛选*\n`;
 
   return report;
 }
@@ -1229,7 +1299,7 @@ async function main(): Promise<void> {
   const summaries = await summarizeArticles(indexedTopArticles, apiKey, lang);
   
   const finalArticles: ScoredArticle[] = topArticles.map((a, i) => {
-    const sm = summaries.get(i) || { titleZh: a.title, summary: a.description.slice(0, 200), reason: '' };
+    const sm = summaries.get(i) || { titleZh: a.title, summary: truncateWords(a.description, DESCRIPTION_MAX_LEN), reason: '' };
     return {
       title: a.title,
       link: a.link,
