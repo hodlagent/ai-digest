@@ -1,9 +1,10 @@
 # AI Digest
 
 Fork 说明：
-1. 不再支持 RSS 数据源的实时，改从 Fusion 的数据库读取————所以需要先运行 [Fusion](https://github.com/0x2e/fusion) 才能使用本项目。
+1. 优先从 [Fusion](https://github.com/0x2e/fusion) 的数据库读取
+  * 如果没有配置 Fusion 的数据库的路径，降为从 RSS 数据源实时抓取
 2. 项目结构尽量与原项目保持一致，方便后续维护和扩展。
-3. 可以复用 Fusion 的优点。
+3. 可以复用 Fusion 的优点，你可以通过 Fusion 管理自己的RSS源、更新数据。
 
 ---
 
