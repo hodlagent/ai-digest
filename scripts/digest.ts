@@ -526,7 +526,7 @@ async function fetchAllFeeds(hours: number, config?: IConfig): Promise<Article[]
 // MiniMax API
 // ============================================================================
 
-async function callMinimax(prompt: string, apiKey: string, model: string = 'MiniMax-M2.5', retries = 3): Promise<string> {
+async function callMinimax(prompt: string, apiKey: string, model: string = 'MiniMax-M2.7', retries = 3): Promise<string> {
   let lastError: Error | undefined;
 
   for (let attempt = 0; attempt < retries; attempt++) {
